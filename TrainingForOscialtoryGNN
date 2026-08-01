@@ -1,0 +1,424 @@
+"""
+Training pipeline for oscillatory GNN models.
+Works with any arm: SL, Kuramoto, Wilson-Cowan, GCN, diffusion, MLP.
+
+Flow:
+  train_one_seed() → train one model, one seed → metrics dict
+  run_arm()        → train multiple seeds, aggregate → summary dict
+  main()           → orchestrate experiments
+"""
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import time
+from dataclasses import dataclass
+
+
+# ============================================================================
+# CONFIGURATION
+# ============================================================================
+
+@dataclass
+class Config:
+    """All hyperparameters in one place."""
+    dataset: str = "Cora"        # VALID_DATASETS = {"Cora", "CiteSeer", "PubMed"}
+    arm: str = "sl"              # oscillatory model type
+    hidden_dim: int = 64
+    n_steps: int = 1             # integration horizon T
+    dt: float = 0.1              # time step
+    integrator: str = "rk4"      # rk4 | euler | imex
+    lr: float = 0.01
+    weight_decay: float = 5e-4
+    epochs: int = 300
+    patience: int = 100          # early stopping patience
+    seeds: list = None           # list of random seeds
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    def __post_init__(self):
+        if self.seeds is None:
+            self.seeds = list(range(10))
+
+
+# ============================================================================
+# REPRODUCIBILITY
+# ============================================================================
+
+def set_seed(seed: int) -> None:
+    """
+    Fix all random number generators.
+    Call once per model initialization to ensure reproducibility.
+    """
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================================
+# DIAGNOSTICS (computed after each training run)
+# ============================================================================
+
+def dirichlet_energy(h: torch.Tensor, edge_index: torch.Tensor, 
+                     edge_weight: torch.Tensor) -> float:
+    """
+    Normalized Dirichlet energy E(H) = trace(H^T L H) / ||H||_F^2
+    
+    Purpose: Detect oversmoothing. As E → 0, all nodes converge to the same
+    direction (feature collapse).
+    
+    Returns: float in [0, 1]
+      E ≈ 0   : oversmoothed (bad)
+      E ≈ 1   : diverse features (good)
+    """
+    row, col = edge_index[0], edge_index[1]
+    diff = h[row] - h[col]
+    energy = 0.5 * (edge_weight * diff.pow(2).sum(-1)).sum()
+    norm = h.pow(2).sum() + 1e-12
+    return (energy / norm).item()
+
+
+def effective_rank(h: torch.Tensor) -> float:
+    """
+    Exponential of the entropy of singular values.
+    Ranges in [1, d].
+    
+    Purpose: Measure latent space richness.
+    
+      eff_rank ≈ 1  : features collapse to 1 principal component
+      eff_rank ≈ d  : features span all dimensions
+    """
+    s = torch.linalg.svdvals(h.detach().float())
+    p = s / (s.sum() + 1e-12)
+    entropy = -(p * (p + 1e-12).log()).sum()
+    return entropy.exp().item()
+
+
+def order_parameter(phase: torch.Tensor | None, 
+                   labels: torch.Tensor | None) -> tuple[float, float]:
+    """
+    Kuramoto order parameter: R = |E[exp(i*theta)]| ∈ [0, 1]
+    
+    Returns (R_global, R_within_class)
+    
+    Purpose: Detect phase synchronization (which is oversmoothing in phase space).
+    
+      R_global → 1  : everyone locked to the same phase (bad)
+      R_global → 0  : random phases (good if diverse)
+      R_class → 1   : within-class phase alignment (good if labels diverse)
+    
+    Only for oscillatory models (SL, Kuramoto). Returns (nan, nan) otherwise.
+    """
+    if phase is None:
+        return float("nan"), float("nan")
+    
+    z = torch.exp(1j * phase.detach().to(torch.float32))  # [N, d]
+    r_global = z.mean(dim=0).abs().mean().item()
+    
+    if labels is None:
+        return r_global, float("nan")
+    
+    r_class = []
+    for c in labels.unique():
+        mask = labels == c
+        if mask.sum() > 1:
+            zc = z[mask]
+            r_class.append(zc.mean(dim=0).abs().mean().item())
+    
+    return r_global, float(np.mean(r_class)) if r_class else float("nan")
+
+
+# ============================================================================
+# SINGLE-SEED TRAINING LOOP
+# ============================================================================
+
+def train_one_seed(model_class, data, cfg: Config, seed: int) -> dict:
+    """
+    Train one model instance on one random seed to convergence.
+    
+    Args:
+      model_class  : The model class (e.g., OscillatoryGNN)
+      data         : PyG Data object with x, y, edge_index, train/val/test masks
+      cfg          : Config with hyperparameters
+      seed         : Random seed for this run
+    
+    Returns:
+      Dictionary with:
+        - test_acc, val_acc         : best validation accuracy and corresponding test
+        - diverged                  : 1 if loss became non-finite, else 0
+        - dirichlet, eff_rank       : final state diagnostics
+        - r_global, r_class         : final order parameter (phase sync detection)
+        - seconds                   : wall-clock time for the run
+        - n_params                  : learnable parameter count
+    """
+    set_seed(seed)
+    device = cfg.device
+    
+    # ---- Setup ----
+    model = model_class(
+        in_dim=data.num_features,
+        hid=cfg.hidden_dim,
+        out_dim=int(data.y.max()) + 1,
+        cfg=cfg
+    ).to(device)
+    
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay
+    )
+    
+    x = data.x.to(device)
+    y = data.y.to(device)
+    train_mask = data.train_mask.to(device)
+    val_mask = data.val_mask.to(device)
+    test_mask = data.test_mask.to(device)
+    
+    # Pre-compute normalized adjacency once
+    from torch_geometric.utils import add_self_loops
+    ei, _ = add_self_loops(data.edge_index, num_nodes=data.num_nodes)
+    row, col = ei[0], ei[1]
+    deg = torch.zeros(data.num_nodes, device=device)
+    deg.scatter_add_(0, row, torch.ones(ei.shape[1], device=device))
+    deg_inv_sqrt = deg.pow(-0.5)
+    deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
+    ew = deg_inv_sqrt[row] * deg_inv_sqrt[col]
+    ei = ei.to(device)
+    ew = ew.to(device)
+    
+    # ---- Training loop ----
+    best_val_acc = 0.0
+    best_test_acc = 0.0
+    best_epoch = 0
+    diverged = False
+    t0 = time.time()
+    
+    for epoch in range(cfg.epochs):
+        # ---- Forward ----
+        model.train()
+        optimizer.zero_grad()
+        
+        logits = model(x, ei, ew)
+        loss = F.cross_entropy(logits[train_mask], y[train_mask])
+        
+        # Detect numerical blow-up
+        if not torch.isfinite(loss):
+            diverged = True
+            break
+        
+        # ---- Backward ----
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+        
+        # ---- Validation ----
+        model.eval()
+        with torch.no_grad():
+            pred = model(x, ei, ew).argmax(dim=-1)
+            train_acc = (pred[train_mask] == y[train_mask]).float().mean().item()
+            val_acc = (pred[val_mask] == y[val_mask]).float().mean().item()
+            test_acc = (pred[test_mask] == y[test_mask]).float().mean().item()
+        
+        # ---- Early stopping on validation accuracy ----
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            best_test_acc = test_acc
+            best_epoch = epoch
+        
+        if epoch - best_epoch > cfg.patience:
+            break
+    
+    # ---- Final diagnostics on converged model ----
+    model.eval()
+    with torch.no_grad():
+        model(x, ei, ew)
+        h = model.last_state
+        dirich = dirichlet_energy(h, ei, ew)
+        eff_rk = effective_rank(h)
+        r_glob, r_clas = order_parameter(model.last_phase, y)
+    
+    elapsed = time.time() - t0
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    return dict(
+        seed=seed,
+        test_acc=best_test_acc,
+        val_acc=best_val_acc,
+        diverged=int(diverged),
+        dirichlet=dirich,
+        eff_rank=eff_rk,
+        r_global=r_glob,
+        r_class=r_clas,
+        seconds=elapsed,
+        n_params=n_params
+    )
+
+
+# ============================================================================
+# AGGREGATE ACROSS SEEDS
+# ============================================================================
+
+def _nanmean(values: list[float]) -> float:
+    """
+    Compute mean, ignoring NaN values (some metrics undefined for some arms).
+    Suppress the RuntimeWarning that numpy normally emits.
+    """
+    v = [x for x in values if not (isinstance(x, float) and np.isnan(x))]
+    return float(np.mean(v)) if v else float("nan")
+
+
+def run_arm(model_class, data, cfg: Config) -> dict:
+    """
+    Train one arm (one model type) across all seeds.
+    
+    Args:
+      model_class  : The model class (e.g., OscillatoryGNN)
+      data         : PyG Data object
+      cfg          : Config with hyperparameters
+    
+    Returns:
+      Dictionary with aggregated metrics (mean over seeds):
+        - acc_mean, acc_std      : test accuracy ± std
+        - dirichlet              : mean Dirichlet energy
+        - eff_rank               : mean effective rank
+        - r_global, r_class      : mean order parameters
+        - n_diverged             : count of divergences
+        - n_params               : parameter count (same for all seeds)
+        - seconds                : mean wall-clock time per seed
+    """
+    print(f"    Training arm '{cfg.arm}' with {len(cfg.seeds)} seeds...")
+    
+    runs = [train_one_seed(model_class, data, cfg, s) for s in cfg.seeds]
+    
+    acc = np.array([r["test_acc"] for r in runs]) * 100
+    
+    return dict(
+        arm=cfg.arm,
+        integrator=cfg.integrator,
+        steps=cfg.n_steps,
+        acc_mean=float(acc.mean()),
+        acc_std=float(acc.std()),
+        dirichlet=_nanmean([r["dirichlet"] for r in runs]),
+        eff_rank=_nanmean([r["eff_rank"] for r in runs]),
+        r_global=_nanmean([r["r_global"] for r in runs]),
+        r_class=_nanmean([r["r_class"] for r in runs]),
+        n_diverged=sum(r["diverged"] for r in runs),
+        n_params=runs[0]["n_params"],
+        seconds=float(np.mean([r["seconds"] for r in runs]))
+    )
+
+
+# ============================================================================
+# DISPLAY RESULTS
+# ============================================================================
+
+def print_table(rows: list[dict], title: str) -> None:
+    """
+    Format and print results as a fixed-width table.
+    
+    Columns (in order):
+      arm      : model name (sl, kuramoto, wc, gcn, diffusion, mlp)
+      integ    : integrator (rk4, imex, euler, -)
+      T        : number of integration steps
+      acc %    : test accuracy, mean ± std
+      Dirich   : Dirichlet energy (→0 is bad)
+      effRank  : effective rank (→1 is bad)
+      R_glob   : global order parameter (→1 is bad for global sync)
+      R_clas   : within-class order parameter (→1 is good)
+      div      : divergence count
+      params   : learnable parameter count
+      s/run    : seconds per seed
+    """
+    print(f"\n{title}")
+    
+    # Header
+    header = (
+        f"{'arm':<11}{'integ':<7}{'T':>3}"
+        f"{'acc %':>14}{'Dirich':>9}{'effRank':>9}"
+        f"{'R_glob':>8}{'R_clas':>8}{'div':>5}{'params':>9}{'s/run':>8}"
+    )
+    print(header)
+    print("-" * len(header))
+    
+    # Rows
+    for r in rows:
+        print(
+            f"{r['arm']:<11}{r['integrator']:<7}{r['steps']:>3}"
+            f"{r['acc_mean']:>9.2f} ±{r['acc_std']:>4.2f}"
+            f"{r['dirichlet']:>9.4f}{r['eff_rank']:>9.2f}"
+            f"{r['r_global']:>8.3f}{r['r_class']:>8.3f}"
+            f"{r['n_diverged']:>5}{r['n_params']:>9}{r['seconds']:>8.1f}"
+        )
+
+
+# ============================================================================
+# MAIN EXPERIMENT ORCHESTRATION
+# ============================================================================
+
+def main(model_class, data, base_cfg: Config, 
+         dataset_name: str,
+         depth_sweep: list[int] = None,
+         skip_depth: bool = False):
+    """
+    Orchestrate the complete experimental protocol.
+    
+    Args:
+      model_class  : The model class (OscillatoryGNN)
+      data         : PyG Data object
+      base_cfg     : Base Config (will be copied and modified per arm)
+      dataset_name : Name of dataset (for printing)
+      depth_sweep  : List of T values to sweep over (e.g., [1, 2, 4, 8, 16])
+      skip_depth   : If True, skip the depth sweep experiment
+    
+    Flow:
+      1. Print dataset statistics
+      2. Experiment 1 (T=1): Compare all arms
+      3. Experiment 2 (T sweep): Watch oversmoothing across arms
+    """
+    if depth_sweep is None:
+        depth_sweep = [1, 2, 4, 8, 16, 32]
+    
+    # ---- Experiment 1: Minimal (T=1) ----
+    print("\n" + "="*100)
+    print(f"EXPERIMENT 1 | {dataset_name} | T=1 (minimal architecture)")
+    print("One graph convolution + one oscillatory step")
+    
+    rows = []
+    for arm, integ in [("mlp", "-"), ("diffusion", "-"), ("gcn", "-"),
+                       ("sl", "rk4"), ("kuramoto", "rk4"), ("wc", "rk4")]:
+        cfg = Config(
+            dataset=dataset_name,
+            arm=arm,
+            n_steps=1,
+            integrator=integ if integ != "-" else "rk4",
+            **{k: v for k, v in base_cfg.__dict__.items() 
+               if k not in ("arm", "n_steps", "integrator")}
+        )
+        result = run_arm(model_class, data, cfg)
+        rows.append(result)
+        print(f"      {arm:<10} done: {result['acc_mean']:.2f} ± {result['acc_std']:.2f}")
+    
+    print_table(rows, f"RESULT 1 | {dataset_name} | T=1")
+    
+    # ---- Experiment 2: Depth sweep ----
+    if not skip_depth:
+        print("\n" + "="*100)
+        print(f"EXPERIMENT 2 | {dataset_name} | Horizon sweep")
+        print(f"T ∈ {depth_sweep}; watch Dirichlet energy and R_global together")
+        
+        rows = []
+        for arm in ["gcn", "sl", "kuramoto", "wc"]:
+            for T in depth_sweep:
+                cfg = Config(
+                    dataset=dataset_name,
+                    arm=arm,
+                    n_steps=T,
+                    integrator="rk4",
+                    **{k: v for k, v in base_cfg.__dict__.items() 
+                       if k not in ("arm", "n_steps", "integrator")}
+                )
+                result = run_arm(model_class, data, cfg)
+                rows.append(result)
+            print(f"      {arm} sweep done")
+        
+        print_table(rows, f"RESULT 2 | {dataset_name} | horizon sweep")

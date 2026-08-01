@@ -1,0 +1,60 @@
+# ============================================================================
+# STABILITY & RELIABILITY METRICS (RQ3: does the integrator blow up?)
+# ============================================================================
+
+class Metric_DivergenceCount:
+    """
+    Number of seeds (out of 10) where the loss became non-finite (NaN or Inf).
+    Range: [0, 10]
+    
+    Computation:
+      During training, check: if not torch.isfinite(loss): diverged = True
+    
+    Reported as:
+      Integer count, e.g. "div=2" means 2 seeds diverged
+    
+    Why it matters:
+      Detects numerical instability in the integrator.
+      - Euler on SL blows up (stiffness)
+      - RK4 is more stable
+      - IMEX is stable by design (implicit amplitude solve)
+    
+    Interpretation:
+      div = 0     : GOOD, stable across all seeds
+      div = 1–2   : ACCEPTABLE, occasional instability
+      div ≥ 3     : BAD, the integrator is unreliable
+      
+      This is RQ3: if Euler diverges but RK4 survives, the stiffness argument is real.
+    
+    Code location: train_one_seed(), check torch.isfinite(loss)
+    """
+
+
+class Metric_WallClockTime:
+    """
+    Seconds per training run (averaged over seeds).
+    
+    Computation:
+      t0 = time.time()
+      [run training loop for 300 epochs or until early stopping]
+      seconds = time.time() - t0
+    
+    Reported as:
+      Float, mean over seeds, e.g. "s/run = 45.3"
+    
+    Why it matters:
+      Hidden cost of oscillatory layers:
+      - SL: 2x GCN (complex arithmetic)
+      - KM: 3x GCN (edge-wise sin, gather-scatter)
+      - WC: 4x GCN (two fields, two operators)
+      
+      RK4 is 4x the coupling evals, but still faster than adaptive step-size solvers.
+    
+    Interpretation:
+      If accuracy gain is ΔAcc%, ask: is it worth ΔTime% additional computation?
+      
+      Example: SL gains 0.6% but costs 2x time → probably not worth it
+                (Platonov et al. show LayerNorm does the same for free)
+    
+    Code location: time.time() before and after train loop
+    """

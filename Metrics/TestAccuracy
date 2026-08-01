@@ -1,0 +1,24 @@
+# ============================================================================
+# PRIMARY METRIC: NODE CLASSIFICATION ACCURACY
+# ============================================================================
+
+class Metric_TestAccuracy:
+    """
+    Test set accuracy (%).
+    
+    Computation:
+      acc = (predictions == ground_truth).float().mean() * 100
+    
+    Reported as:
+      acc_mean ± acc_std (over 10 seeds)
+    
+    Why it matters:
+      The main task. But on homophilous graphs (Cora/CiteSeer/PubMed),
+      a 2-layer GCN with LayerNorm+residual is already near-SOTA.
+      Do NOT claim oscillator success unless gain > 1.5σ.
+    
+    Interpretation:
+      Cora/CiteSeer/PubMed: oscillators should tie within noise
+      Chameleon/Squirrel:   degree-selective mechanisms (WC) might help
+      Roman-empire:         long-range transport (SL) should show gains
+    """

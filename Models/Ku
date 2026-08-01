@@ -1,0 +1,92 @@
+"""
+# Inicializar
+km = KuramotoLayer(dim=64, dt=0.1, n_steps=8, integrator="rk4")
+
+# El encoder mapea features reales a fases en [-π, π]
+theta = math.pi * torch.tanh(features)  # [N, d]
+
+# Integrar
+theta = km(theta, edge_index, edge_weights)
+
+# Decodificar usando cos(theta) para evitar la rama cut de atan2
+output = torch.cos(theta)
+
+# Ver el order parameter (sincronización)
+z = torch.exp(1j * theta)
+r_global = z.mean(dim=0).abs().mean().item()  # en [0, 1]
+# r_global -> 1 = sincronización global (oversmoothing en fase)
+# r_global -> 0 = incoherencia (diversidad en fase)
+"""
+
+class KuramotoLayer(nn.Module):
+    """
+    Phase-only Kuramoto dynamics. The state IS a phase, theta in [-pi, pi]^{N x d}.
+
+        dtheta_i/dt = omega + [ sum_j A_hat_ij sin(theta_j - theta_i) ] @ W
+
+    Two deliberate design choices, both flagged because they matter:
+
+    1. The sine coupling is computed EDGE-WISE (gather-scatter), not as a sparse
+       matmul, because sin(theta_j - theta_i) does not factorise. This is ~3x
+       slower than A_hat @ H at equal edge count -- a real cost that FLOP counts
+       hide. Measure wall-clock, not FLOPs.
+
+    2. The learnable weight W is applied to the coupling OUTPUT (a phase
+       velocity), not to the phases themselves. Applying W to the phases would
+       destroy the circular semantics. This deviates from Eq. (9) of the SLGNN
+       paper (which puts the learnable part in an attention coefficient) but is
+       necessary to match the parameter count of the GCN baseline exactly.
+
+    Why the sine matters (this is the mechanism to test): Kuramoto is the
+    gradient flow of  H(theta) = -sum_ij A_hat_ij cos(theta_i - theta_j).
+    Laplacian smoothing is the same flow with a quadratic potential. The
+    influence function is therefore sin(Delta) (redescending) instead of Delta
+    (unbounded), so the EFFECTIVE edge weight is A_hat_ij * sinc(Delta_ij):
+    it decays to 0 as neighbours disagree and turns NEGATIVE past |Delta| = pi.
+    That is signed, parameter-free attention.
+    """
+
+    def __init__(self, dim: int, dt: float, n_steps: int, integrator: str = "rk4"):
+        super().__init__()
+        self.dt, self.n_steps, self.integrator = dt, n_steps, integrator
+        self.omega = nn.Parameter(torch.ones(dim))       # per-channel natural frequency
+        self.kappa = nn.Parameter(torch.tensor(1.0))     # coupling strength
+        self.lin = nn.Linear(dim, dim, bias=False)       # channel mixing of the phase velocity
+
+    def _field(self, theta, ei, ew):
+        """
+        Return dtheta/dt for the coupled Kuramoto system.
+        
+        Args:
+            theta: phase matrix [N, d], each entry in [-pi, pi]
+            ei: edge index [2, E]
+            ew: normalized edge weights [E]
+        
+        Returns:
+            dtheta/dt [N, d]
+        """
+        row, col = ei[0], ei[1]
+        # Edge-wise sin(theta_j - theta_i), scattered back onto the target node i.
+        # msg[edge_k] = ew[k] * sin(theta[col[k]] - theta[row[k]])  [E, d]
+        msg = ew.unsqueeze(-1) * torch.sin(theta[col] - theta[row])   # [E, d]
+        # Aggregate onto each node: sum over all incoming edges
+        agg = torch.zeros_like(theta).index_add_(0, row, msg)         # [N, d]
+        # Apply learnable channel mixing and add natural frequency
+        return self.omega + self.kappa * self.lin(agg)
+
+    def forward(self, theta, ei, ew):
+        """
+        Integrate the Kuramoto dynamics for n_steps iterations.
+        
+        Args:
+            theta: initial phase matrix [N, d], in [-pi, pi]
+            ei: edge index [2, E]
+            ew: normalized edge weights [E]
+        
+        Returns:
+            theta_final [N, d] after T time steps
+        """
+        step = rk4_step if self.integrator == "rk4" else euler_step
+        for _ in range(self.n_steps):
+            theta = step(lambda s: self._field(s, ei, ew), theta, self.dt)
+        return theta

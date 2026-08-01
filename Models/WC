@@ -1,0 +1,162 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+"""
+#How to use:
+wc = WilsonCowanLayer(dim=64, dt=0.1, n_steps=8)
+
+# During the forward contract
+e_init = torch.sigmoid(features)  # ambos campos en (0, 1)
+i_init = torch.sigmoid(features)
+
+# Integration
+e_final, i_final = wc(e_init, i_init, edge_index, edge_weights)
+
+output = e_final
+
+# Check if it oscillated (diagnosis)
+print(f"Oscillation amplitude: {wc.osc_amplitude:.4f}")
+"""
+
+
+
+class WilsonCowanLayer(nn.Module):
+    """
+    Two-population neural model: Excitatory (E) and Inhibitory (I) fields.
+    
+    Dynamics:
+        tau_E * dE/dt = -E + S( c_EE*E - c_EI*I + k_E*(A_hat @ E @ W) + P )
+        tau_I * dI/dt = -I + S( c_IE*E - c_II*I + k_I*(A_hat @ E @ W) + Q )
+    
+    where S(x) = sigmoid(slope * (x - threshold))
+    
+    Key insight: The E-I loop can produce oscillations (Hopf bifurcation).
+    Graph coupling with different E/I ranges can trigger Turing patterns.
+    """
+    
+    def __init__(self, dim: int, dt: float = 0.1, n_steps: int = 1):
+        super().__init__()
+        
+        # Integration parameters
+        self.dt = dt
+        self.n_steps = n_steps
+        
+        # ---- Connectivity constants (classic Wilson & Cowan 1972) ----
+        # These are NOT arbitrary; they set the Hopf bifurcation regime.
+        self.c_ee = nn.Parameter(torch.tensor(16.0))    # E <- E (excites itself)
+        self.c_ei = nn.Parameter(torch.tensor(12.0))    # E <- I (inhibits)
+        self.c_ie = nn.Parameter(torch.tensor(15.0))    # I <- E (excited by E)
+        self.c_ii = nn.Parameter(torch.tensor(3.0))     # I <- I (self-inhibition)
+        
+        # ---- Graph coupling strength ----
+        self.k_e = nn.Parameter(torch.tensor(0.5))      # how much E couples to the graph
+        self.k_i = nn.Parameter(torch.tensor(0.25))     # how much I couples to the graph
+        
+        # ---- External drives (sets the operating point) ----
+        self.drive_e = nn.Parameter(torch.tensor(1.25)) # P: external input to E
+        self.drive_i = nn.Parameter(torch.tensor(0.0))  # Q: external input to I
+        
+        # ---- Sigmoid parameters ----
+        self.slope = nn.Parameter(torch.tensor(1.0))
+        self.thresh = nn.Parameter(torch.tensor(2.5))
+        
+        # ---- The graph convolution weight (shared across all T steps) ----
+        self.lin = nn.Linear(dim, dim, bias=False)
+        
+        # ---- Diagnostic: did the E-I loop actually oscillate? ----
+        self.osc_amplitude = float("nan")
+    
+    def sigmoid(self, x):
+        """S(x) = 1 / (1 + exp(-slope * (x - thresh)))"""
+        return torch.sigmoid(self.slope * (x - self.thresh))
+    
+    def vector_field(self, e, i, graph_prop):
+        """
+        Returns (de/dt, di/dt) at the current state.
+        
+        Args:
+            e: excitatory field [N, d]
+            i: inhibitory field [N, d]
+            graph_prop: A_hat @ e @ W  [N, d]  (pre-computed)
+        
+        Returns:
+            (de/dt, di/dt)  each [N, d]
+        """
+        tau_e = F.softplus(self.log_tau_e) + 1e-3  # ensure > 0
+        tau_i = F.softplus(self.log_tau_i) + 1e-3
+        
+        # de/dt = (-e + S(recurrent + coupling + external)) / tau_e
+        de = (-e + self.sigmoid(
+            self.c_ee * e - self.c_ei * i + self.k_e * graph_prop + self.drive_e
+        )) / tau_e
+        
+        # di/dt = (-i + S(recurrent + coupling + external)) / tau_i
+        di = (-i + self.sigmoid(
+            self.c_ie * e - self.c_ii * i + self.k_i * graph_prop + self.drive_i
+        )) / tau_i
+        
+        return de, di
+    
+    def rk4_step(self, e, i, graph_prop):
+        """
+        One RK4 step: s_{n+1} = s_n + (dt/6)(k1 + 2*k2 + 2*k3 + k4)
+        """
+        # k1 = f(s_n)
+        k1_e, k1_i = self.vector_field(e, i, graph_prop)
+        
+        # k2 = f(s_n + 0.5*dt*k1)
+        k2_e, k2_i = self.vector_field(e + 0.5 * self.dt * k1_e,
+                                       i + 0.5 * self.dt * k1_i,
+                                       graph_prop)
+        
+        # k3 = f(s_n + 0.5*dt*k2)
+        k3_e, k3_i = self.vector_field(e + 0.5 * self.dt * k2_e,
+                                       i + 0.5 * self.dt * k2_i,
+                                       graph_prop)
+        
+        # k4 = f(s_n + dt*k3)
+        k4_e, k4_i = self.vector_field(e + self.dt * k3_e,
+                                       i + self.dt * k3_i,
+                                       graph_prop)
+        
+        # Weighted average: (k1 + 2*k2 + 2*k3 + k4) / 6
+        e_new = e + self.dt * (k1_e + 2 * k2_e + 2 * k3_e + k4_e) / 6
+        i_new = i + self.dt * (k1_i + 2 * k2_i + 2 * k3_i + k4_i) / 6
+        
+        return e_new, i_new
+    
+    def forward(self, e, i, adjacency_index, adjacency_weights):
+        """
+        Integrate the E-I dynamics for n_steps iterations.
+        
+        Args:
+            e: excitatory state [N, d]
+            i: inhibitory state [N, d]
+            adjacency_index: edge list [2, E]
+            adjacency_weights: normalized edge weights [E]
+        
+        Returns:
+            (e_final, i_final) after T time steps
+        """
+        # Pre-compute the graph coupling term once per forward pass
+        # graph_prop = A_hat @ e @ W
+        e_lin = self.lin(e)  # e @ W
+        row, col = adjacency_index[0], adjacency_index[1]
+        graph_prop = torch.zeros_like(e)
+        graph_prop.index_add_(0, row, adjacency_weights.unsqueeze(-1) * e_lin[col])
+        
+        # Track the excursion of E to detect the "silent collapse" failure
+        e_min = e.detach().clone()
+        e_max = e.detach().clone()
+        
+        # Integrate for n_steps time steps
+        for step in range(self.n_steps):
+            e, i = self.rk4_step(e, i, graph_prop)
+            e_min = torch.minimum(e_min, e.detach())
+            e_max = torch.maximum(e_max, e.detach())
+        
+        # Diagnostic: oscillation amplitude
+        self.osc_amplitude = (e_max - e_min).mean().item()
+        
+        return e, i

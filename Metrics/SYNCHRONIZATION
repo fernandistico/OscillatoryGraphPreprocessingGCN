@@ -1,0 +1,91 @@
+# ============================================================================
+# OSCILLATION / SYNCHRONIZATION METRICS (RQ4: do they synchronise or oscillate?)
+# ============================================================================
+
+class Metric_GlobalOrderParameter:
+    """
+    Kuramoto order parameter (global): R_glob = |mean_j exp(i*theta_j)| ∈ [0, 1]
+    
+    Computation:
+      z = exp(i * theta)     # unit vectors on the circle
+      R = |mean(z)|          # magnitude of the mean
+    
+    Reported as:
+      Single scalar, mean over seeds
+    
+    Why it matters:
+      Detects global phase synchronisation (which is oversmoothing in phase space).
+    
+    Interpretation:
+      R_glob → 1  : everyone locked to the same phase (BAD, entire layer collapsed)
+      R_glob → 0  : random phases (GOOD, diversity in phase)
+      
+      If R_glob → 1 and accuracy is good, the model found a trivial solution.
+      If R_glob → 0 and R_class → 1, the model separated classes by phase.
+    
+    Only defined for: SL, Kuramoto
+    Otherwise: NaN (not reported)
+    
+    Code location: order_parameter()
+    """
+
+
+class Metric_WithinClassOrderParameter:
+    """
+    Kuramoto order parameter (within-class): R_class = mean_c R_c
+    where R_c = |mean_i∈class_c exp(i*theta_i)|
+    
+    Computation:
+      for each class c:
+        z_c = exp(i * theta[labels==c])
+        R_c = |mean(z_c)|
+      R_class = mean([R_c for all c])
+    
+    Reported as:
+      Single scalar, mean over seeds
+    
+    Why it matters:
+      The GOOD regime for classification is R_glob LOW + R_class HIGH.
+      This means: different classes are in different phases, but nodes within
+      a class are phase-aligned. Cluster synchronisation.
+    
+    Interpretation:
+      R_glob=0.1, R_class=0.8  : GOOD — class-wise sync, global desync
+      R_glob=0.9, R_class=0.9  : BAD — everything locked (collapsed)
+      R_glob=0.5, R_class=0.5  : NEUTRAL — moderate clustering
+    
+    Only defined for: SL, Kuramoto
+    Otherwise: NaN
+    
+    Code location: order_parameter()
+    """
+
+
+class Metric_OscillationAmplitude:
+    """
+    Wilson-Cowan specific: excursion of the excitatory field over T steps.
+    
+    Computation:
+      During integration, track E_min = min_t E(t), E_max = max_t E(t)
+      amp = mean_i (E_max[i] - E_min[i])
+    
+    Reported as:
+      Single scalar per arm, mean over seeds
+    
+    Why it matters:
+      CRITICAL DIAGNOSTIC for WC. The E-I loop can silently collapse to a
+      fixed point without diverging or warning.
+    
+    Interpretation:
+      amp ~ 0.0   : E settled to a fixed point (NOT oscillating, silent failure)
+      amp ~ 0.01  : very weak oscillation (barely alive)
+      amp ~ 0.5+  : strong oscillation (E-I loop is healthy)
+      
+      If oscAmp ≈ 0 but accuracy is OK, the WC layer is a saturating smoother,
+      not an oscillator. This is a failure mode that ONLY this metric catches.
+    
+    Only defined for: WC
+    Otherwise: NaN
+    
+    Code location: WilsonCowanLayer.forward() / train_one_seed()
+    """

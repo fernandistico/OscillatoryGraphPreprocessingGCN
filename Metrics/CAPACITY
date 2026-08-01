@@ -1,0 +1,84 @@
+# ============================================================================
+# PARAMETER COUNT & CAPACITY MATCHING (RQ5: mechanism or capacity?)
+# ============================================================================
+
+class Metric_LearableParameterCount:
+    """
+    Total number of learnable parameters in the model.
+    
+    Computation:
+      n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    
+    Reported as:
+      Integer, e.g. "params=65536"
+    
+    Why it matters:
+      THE confound that invalidates most papers.
+      
+      SL carries 2d state (complex):  2*N*d real numbers per node
+      WC carries 2d state (E, I):     2*N*d real numbers per node
+      GCN carries d:                  N*d real numbers per node
+      Kuramoto carries d:             N*d real numbers per node
+      
+      If you claim SL beats GCN on the same benchmark, you MUST control for this.
+    
+    Interpretation:
+      n_params should be MATCHED across arms for a fair comparison.
+      
+      Fair:    sl (d=64, 2d real) vs gcn (d=128, d real) ← same # params
+      Unfair:  sl (d=64) vs gcn (d=64)                   ← SL has 2x capacity
+    
+    Code location: sum(p.numel() for p in model.parameters() if p.requires_grad)
+    """
+
+# ============================================================================
+# DATASET-SPECIFIC METRICS (RQ1–RQ2: which graph properties matter?)
+# ============================================================================
+
+class Metric_EdgeHomophily:
+    """
+    Fraction of edges whose endpoints have the same label.
+    h = |{(i,j) ∈ E : y_i == y_j}| / |E|
+    Range: [0, 1]
+    
+    Computation:
+      row, col = edge_index
+      h = (y[row] == y[col]).float().mean()
+    
+    Why it matters:
+      Low-pass filter (GCN) is already near-optimal for high homophily.
+      Oscillators should NOT help on Cora/CiteSeer/PubMed (h > 0.7).
+      
+    Reported in: STEP 2 (graph statistics), not in the main results table
+    """
+
+
+class Metric_AverageDegree:
+    """
+    Mean degree: <k> = 2|E| / |V|
+    
+    Why it matters:
+      Dense graphs (high <k>) synchronise easily → oversmoothing risk.
+      Sparse graphs (low <k>) resist synchronisation → oscillators stay diverse.
+    
+    Reported in: STEP 2 (graph statistics)
+    """
+
+
+class Metric_SpectralEigenratio:
+    """
+    λ_n / λ_2 where λ is the normalized Laplacian eigenvalue.
+    
+    Why it matters:
+      PREDICTS synchronisability (and thus oversmoothing risk).
+      
+      λ_n / λ_2 ~ 1    : graph is well-connected (synchronises easily)
+      λ_n / λ_2 >> 1   : graph is chain-like (resistant to sync)
+      
+      Roman-empire: λ_n / λ_2 ≈ 2.1×10^8 (extreme eigenratio)
+      
+    Reported in: STEP 2 (graph statistics)
+    Not in main results table, but critical for interpreting RQ2
+    """
+
+

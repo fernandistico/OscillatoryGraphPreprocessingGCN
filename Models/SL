@@ -1,0 +1,141 @@
+class StuartLandauLayer(nn.Module):
+    """
+    Complex-valued Stuart-Landau dynamics (SLGNN paper, Eq. in Section 4):
+
+        dz/dt = (alpha + i*omega - (beta + i*gamma)|z|^2) z  +  F_theta(z)
+
+    State: z = zr + i*zi, both [N, d]. The coupling is applied identically to
+    the real and imaginary parts with a SHARED real weight matrix, which keeps
+    the parameter count matched to the GCN baseline. Set complex_weights=True
+    for a fully complex W (doubles the coupling parameters).
+
+    Fixed point of the isolated oscillator: r_inf = sqrt(alpha/beta) for
+    alpha, beta > 0. This limit cycle is the anti-collapse mechanism: node
+    magnitudes cannot decay to zero.
+
+    Two integrators:
+      'rk4'  -> generic RK4 on the full complex field (requested extension)
+      'imex' -> the paper's bespoke scheme: explicit coupling, then polar
+                decomposition, implicit (Newton) solve of the stiff cubic
+                magnitude equation, explicit phase update.
+    """
+
+    def __init__(self, dim: int, dt: float, n_steps: int, integrator: str = "rk4",
+                 complex_weights: bool = False):
+        super().__init__()
+        self.dt, self.n_steps, self.integrator = dt, n_steps, integrator
+        # Oscillator parameters. Learnable, one scalar each, initialised inside
+        # the search ranges reported in the SLGNN paper Appendix A:
+        #   alpha in [-0.5, 0.5], beta in [0, 2], omega in [0.5, 2], gamma in [-1, 2]
+        self.alpha = nn.Parameter(torch.tensor(0.5))   # Hopf parameter (>0 -> limit cycle)
+        self.beta = nn.Parameter(torch.tensor(1.0))    # cubic saturation (>0 required)
+        self.omega = nn.Parameter(torch.tensor(1.0))   # natural frequency
+        self.gamma = nn.Parameter(torch.tensor(0.0))   # shear / non-isochronicity
+        self.coupling_r = GCNCoupling(dim)
+        self.coupling_i = GCNCoupling(dim) if complex_weights else self.coupling_r
+
+    # ---- vector field ---------------------------------------------------
+    def _field(self, zr, zi, ei, ew):
+        """Return (dzr/dt, dzi/dt) for the coupled Stuart-Landau system."""
+        r2 = zr * zr + zi * zi                                   # |z|^2
+        # Local term: (alpha + i*omega - (beta + i*gamma) r^2) * (zr + i*zi)
+        a_eff = self.alpha - self.beta * r2                      # real part of the scalar
+        w_eff = self.omega - self.gamma * r2                     # imag part of the scalar
+        dzr = a_eff * zr - w_eff * zi + self.coupling_r(zr, ei, ew)
+        dzi = w_eff * zr + a_eff * zi + self.coupling_i(zi, ei, ew)
+        return dzr, dzi
+
+    # ---- paper's IMEX step ----------------------------------------------
+    def _imex_step(self, zr, zi, ei, ew):
+        """
+        Algorithm 1 of the SLGNN paper.
+
+        NOTE ON TWO DISCREPANCIES in the published pseudocode, resolved here in
+        favour of the stated ODE (verify against the authors' released code):
+          (i)  the pseudocode writes  R_new = R~ + dt(alpha - beta R_new^3);
+               the amplitude ODE  dr/dt = (alpha - beta r^2) r  gives
+               R_new = R~ + dt(alpha R_new - beta R_new^3).  We use the latter.
+          (ii) the pseudocode writes  Phi_new = Phi~ + dt(omega + gamma R^2);
+               the ODE gives  dphi/dt = omega - gamma r^2.  We use the latter.
+        """
+        # 1. Explicit step for the non-stiff coupling term
+        zr = zr + self.dt * self.coupling_r(zr, ei, ew)
+        zi = zi + self.dt * self.coupling_i(zi, ei, ew)
+        # 2. Cartesian -> polar
+        r = torch.sqrt(zr * zr + zi * zi + 1e-12)
+        phi = torch.atan2(zi, zr)
+        # 3. Implicit solve of  g(R) = R - r - dt*(alpha*R - beta*R^3) = 0
+        #    Newton's method, 5 iterations, initialised at the explicit value.
+        R = r.clone()
+        for _ in range(5):
+            g = R - r - self.dt * (self.alpha * R - self.beta * R.pow(3))
+            dg = 1 - self.dt * (self.alpha - 3 * self.beta * R.pow(2))
+            dg = torch.where(dg.abs() < 1e-4, torch.full_like(dg, 1e-4), dg)  # guard
+            R = R - g / dg
+        R = R.clamp(min=0.0)                      # an amplitude cannot be negative
+        # 4. Explicit phase update using the NEW magnitude
+        phi = phi + self.dt * (self.omega - self.gamma * R.pow(2))
+        # 5. Polar -> Cartesian
+        return R * torch.cos(phi), R * torch.sin(phi)
+
+    def forward(self, zr, zi, ei, ew):
+        """
+        Integrate the Stuart-Landau dynamics for n_steps iterations.
+        
+        Args:
+            zr: real part [N, d]
+            zi: imaginary part [N, d]
+            ei: edge index [2, E]
+            ew: normalized edge weights [E]
+        
+        Returns:
+            (zr_final, zi_final) after T time steps
+        """
+        for _ in range(self.n_steps):
+            if self.integrator == "imex":
+                zr, zi = self._imex_step(zr, zi, ei, ew)
+            else:
+                # RK4 or Euler on the full complex field
+                f = lambda s: self._field(s[0], s[1], ei, ew)
+                step = rk4_step if self.integrator == "rk4" else euler_step
+                zr, zi = step(f, (zr, zi), self.dt)
+        return zr, zi
+
+
+class GCNCoupling(nn.Module):
+    """F_theta(H) = LeakyReLU( A_hat @ H @ W )"""
+    def __init__(self, dim: int, negative_slope: float = 0.2):
+        super().__init__()
+        self.lin = nn.Linear(dim, dim, bias=False)
+        self.negative_slope = negative_slope
+
+    def forward(self, h, ei, ew):
+        return F.leaky_relu(propagate(self.lin(h), ei, ew), self.negative_slope)
+
+
+def propagate(h: torch.Tensor, ei: torch.Tensor, ew: torch.Tensor) -> torch.Tensor:
+    """Sparse product  A_hat @ h.  h: [N, d] -> [N, d]."""
+    row, col = ei[0], ei[1]
+    out = torch.zeros_like(h)
+    out.index_add_(0, row, ew.unsqueeze(-1) * h[col])
+    return out
+
+
+def rk4_step(f, state, dt: float):
+    """Classical 4th-order Runge-Kutta."""
+    k1 = f(state)
+    k2 = f(_axpy(state, k1, dt / 2))
+    k3 = f(_axpy(state, k2, dt / 2))
+    k4 = f(_axpy(state, k3, dt))
+    if isinstance(state, tuple):
+        incr = tuple((a + 2 * b + 2 * c + d) / 6 for a, b, c, d in zip(k1, k2, k3, k4))
+    else:
+        incr = (k1 + 2 * k2 + 2 * k3 + k4) / 6
+    return _axpy(state, incr, dt)
+
+
+def _axpy(state, incr, dt: float):
+    """state + dt * incr, for a tensor or a tuple-of-tensors."""
+    if isinstance(state, tuple):
+        return tuple(s + dt * i for s, i in zip(state, incr))
+    return state + dt * incr

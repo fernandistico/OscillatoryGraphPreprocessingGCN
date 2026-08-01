@@ -1,0 +1,60 @@
+# ============================================================================
+# OVERSMOOTHING METRICS (RQ2: does it resist oversmoothing?)
+# ============================================================================
+
+class Metric_DirichletEnergy:
+    """
+    Dirichlet energy E(H) = trace(H^T L H) / ||H||_F^2  ∈ [0, 1]
+    
+    Computation:
+      diff = h[row] - h[col]  (per-edge differences)
+      energy = 0.5 * sum_edges ew * ||diff||^2
+      E_norm = energy / (||H||_F^2 + eps)
+    
+    Reported as:
+      Single scalar per arm, aggregated over seeds by mean
+    
+    Why it matters:
+      THE oversmoothing metric. Detects feature collapse.
+    
+    Interpretation:
+      E → 0      : all nodes converged to same direction (BAD)
+      E ~ 0.5    : moderate diversity
+      E ~ 1      : rich, diverse features (GOOD)
+      
+    Plot this vs T (integration steps):
+      GCN:       E(T) decays exponentially → oversmoothing
+      Oscillator: E(T) should plateau → no collapse
+    
+    Code location: dirichlet_energy()
+    """
+
+
+class Metric_EffectiveRank:
+    """
+    Participation ratio of the singular value spectrum: exp(H_entropy(σ))
+    Range: [1, d]
+    
+    Computation:
+      s = torch.linalg.svdvals(H)          # singular values
+      p = s / s.sum()                       # normalized spectrum
+      entropy = -sum(p * log(p))
+      eff_rank = exp(entropy)
+    
+    Reported as:
+      Single scalar per arm
+    
+    Why it matters:
+      Detects "silent collapse": accuracy stays OK but features die.
+      GCN often collapses to a 1-D subspace.
+    
+    Interpretation:
+      eff_rank ~ 1  : features live in a 1-D line (COLLAPSED)
+      eff_rank ~ d/2: moderate diversity
+      eff_rank ~ d   : full d-dimensional space (GOOD)
+      
+    Red flag: eff_rank drops while accuracy stays same → the model
+    found a degenerate solution.
+    
+    Code location: effective_rank()
+    """

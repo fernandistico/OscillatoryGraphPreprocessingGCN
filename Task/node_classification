@@ -1,0 +1,16 @@
+# eval_node_classification.py
+def evaluate_node_classification(
+    X,                          # augmented or baseline features
+    y,                          # labels
+    A,                          # adjacency
+    model_depth,                # L in {1, 2, 4, 6, 8, 10, 12, 16}
+    dataset_name,               # Cora | CiteSeer | PubMed
+    seed,
+    n_runs=8                    # per-seed runs
+):
+    """    
+    Returns:
+      accuracy (float): test set accuracy
+      std (float): across-seed standard deviation
+      cka_value (float): linear CKA to frozen model
+    """

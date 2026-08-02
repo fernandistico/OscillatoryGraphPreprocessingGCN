@@ -1,0 +1,16 @@
+# eval_link_prediction.py
+def evaluate_link_prediction_leakage_free(
+    X,
+    A,
+    dataset_name,
+    split_frac={'train': 0.85, 'val': 0.05, 'test': 0.10}
+):
+    """
+    Link prediction with leakage-free protocol (Sec. 3.1 of paper).
+    
+    Returns:
+      mrr (float): filtered mean reciprocal rank
+      hits_k (dict): Hits@1, Hits@3, Hits@10
+      roc_auc (float): ROC-AUC
+      metrics_vs_random_ctrl (dict): delta vs matched-width random
+    """

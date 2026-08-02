@@ -90,28 +90,6 @@ All results follow leakage-free evaluation protocols: edge partitioning occurs *
 
 ---
 
-## Repository Structure
-
-```
-OscillatoryGraphPreprocessingGCN/
-├── Models/               # Oscillatory system implementations
-│   ├── kuramoto.py       # Phase synchronization model
-│   ├── stuart_landau.py  # Amplitude–phase dynamics
-│   └── wilson_cowan.py   # Excitatory–inhibitory populations
-├── Analysis/             # Evaluation and visualization
-│   ├── metrics.py        # Accuracy, stability, CKA metrics
-│   └── depth_sweep.py    # Depth robustness evaluation
-├── Task/                 # Experimental orchestration
-│   └── train_gnn.py      # Training loops and validation
-├── requirements.txt      # Python dependencies
-├── README.md             # This file
-├── PAPER.md              # Full paper reference and abstract
-├── METHOD_OVERVIEW.md    # High-level method description
-└── REPRODUCIBILITY.md    # General reproducibility guidelines
-```
-
----
-
 ## Methodology (Conceptual Overview)
 
 The approach consists of three phases:
